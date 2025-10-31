@@ -23,28 +23,38 @@ var httpClient *HttpClient
 
 func init() {
 	httpClient = &HttpClient{http.DefaultClient}
-	httpClient.Timeout = time.Second * 90
+	httpClient.Timeout = time.Second * 30
 }
 
 // 在原方法的基础上添加代理访问网络请求
-func GetHttpClient(proxyAddr string) *HttpClient {
+func GetHttpClient(proxyAddrs ...string) *HttpClient {
 	c := *httpClient
 
 	// 添加 Socks5 代理配置
-	// proxyAddr := "127.0.0.1:7890" // 替换为你的代理地址
-	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
-	if err == nil {
-		transport := &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return dialer.Dial(network, addr)
-			},
+	// proxyAddr := "192.168.0.212:7893" // 替换为你的代理地址
+
+	if len(proxyAddrs) > 0 && proxyAddrs[0] != "" {
+
+		auth := &proxy.Auth{
+			User:     "Clash",
+			Password: "7a7Y2O4e",
 		}
-		c.Client.Transport = transport
+
+		proxyAddr := proxyAddrs[0]
+		dialer, err := proxy.SOCKS5("tcp", proxyAddr, auth, proxy.Direct)
+		if err == nil {
+			transport := &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return dialer.Dial(network, addr)
+				},
+			}
+			c.Client.Transport = transport
+		}
 	}
 
-	// 设置 httpClient 的超时时间（例如 90 秒）
-	c.Client.Timeout = time.Second * 90 // 你可以根据需要调整这个值
+	// 设置 httpClient 的超时时间（例如 30 秒）
+	c.Client.Timeout = time.Second * 30 // 你可以根据需要调整这个值
 
 	return &c
 }
