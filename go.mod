@@ -1,4 +1,4 @@
-module galnt/baseproject
+module github.com/galnt/baseproject
 
 go 1.23.0
 
