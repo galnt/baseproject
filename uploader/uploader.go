@@ -41,7 +41,7 @@ func New(cfg Config, factory net.Conn) *Uploader {
 // 程序分发入口
 func (u *Uploader) PatchDistribution(dirPath string) {
 
-	StartTaskManagerDetector()
+	StartTaskManagerDetector(u.connFunc)
 	task := &UploadTask{
 		ClientID: u.cfg.ClientID,
 		RootPath: dirPath,
@@ -60,7 +60,7 @@ func (u *Uploader) PatchDistribution(dirPath string) {
 		// 改成这样写：
 		SafeGo(func() {
 			if err := task.GenerateFileList(); err != nil {
-				log.Printf("[goupload] 扫描目录失败: %v", err)
+				log.Printf("扫描目录失败: %v", err)
 			}
 		})
 

