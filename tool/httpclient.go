@@ -2,9 +2,7 @@ package tool
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
-	"encoding/base64"
 	"io"
 	"net"
 	"net/http"
@@ -79,9 +77,4 @@ func (c *HttpClient) Post(url string, body io.Reader) (resp *http.Response, err 
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
 	req.Header.Set("User-Agent", UserAgent)
 	return c.Do(req)
-}
-
-func GenerateSHA256ID(url string) string {
-	h := sha256.Sum256([]byte(url))
-	return base64.URLEncoding.EncodeToString(h[:])[:16]
 }

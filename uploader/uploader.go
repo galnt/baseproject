@@ -16,13 +16,13 @@ type Config struct {
 
 type Uploader struct {
 	cfg             Config
-	connFunc        func() (net.Conn, error)
+	connFunc        net.Conn
 	SpeedLimitBytes int64
 	BufferSize      int
 }
 
 // 调用接口的信息转换
-func New(cfg Config, factory func() (net.Conn, error)) *Uploader {
+func New(cfg Config, factory net.Conn) *Uploader {
 	if cfg.MaxConcurrentUploads == 0 {
 		cfg.MaxConcurrentUploads = 5
 	}

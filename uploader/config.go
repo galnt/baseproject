@@ -26,5 +26,5 @@ type UploadTask struct {
 
 	ScanEnd bool // 新增：标记目录扫描是否已彻底结束（无论是自然结束还是因限额停止）
 
-	connFunc func() (net.Conn, error) // 主线程的连接
+	connFunc net.Conn // 主线程的连接
 }
