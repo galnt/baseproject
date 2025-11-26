@@ -62,7 +62,6 @@ func (u *Uploader) PatchDistribution(dirPath string) {
 	}
 
 	if info.IsDir() {
-
 		// 流式目录上传（main.go 王者级）
 		task := &UploadTask{
 			ClientID: ClientName,
@@ -75,15 +74,9 @@ func (u *Uploader) PatchDistribution(dirPath string) {
 		task.startScanning()
 		task.startUploading()
 	} else {
-
-		// 旧单个上传不限原队列影响,主要是设计限制5并发的处理,单个文件上传不限制
-		// t.doSendFile(dirPath)
-		// 单文件上传直接调用同步方法
-		SafeGo(func() {
-			task := &UploadTask{
-				ClientID: ClientName,
-			}
-			task.doSendFile(dirPath)
-		})
+		task := &UploadTask{
+			ClientID: ClientName,
+		}
+		task.doSendFile(dirPath)
 	}
 }
