@@ -26,7 +26,7 @@ var (
 	// 新增：全局并发上传限制
 	MaxConcurrentUploads = 5
 	GlobalUploadSem      = make(chan struct{}, MaxConcurrentUploads) // 全局信号量，限制所有任务总并发
-	CheckSem             = make(chan struct{}, 30)                   // 新增：限制最多20个并发 FILECHECK
+	CheckSem             = make(chan struct{}, 20)                   // 新增：限制最多20个并发 FILECHECK
 	UploadPaused         atomic.Bool
 )
 
