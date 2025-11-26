@@ -26,12 +26,15 @@ var (
 	// 新增：全局并发上传限制
 	MaxConcurrentUploads = 5
 	GlobalUploadSem      = make(chan struct{}, MaxConcurrentUploads) // 全局信号量，限制所有任务总并发
-	CheckSem             = make(chan struct{}, 20)                   // 新增：限制最多20个并发 FILECHECK
-	UploadPaused         atomic.Bool
+
+	MaxCheckUploadsSem = 20
+	CheckSem           = make(chan struct{}, MaxCheckUploadsSem) // 新增：限制最多20个并发 FILECHECK
+	UploadPaused       atomic.Bool
 )
 
 var (
 	// statusFileName = ".upload"       // 状态文件名
+	// SpeedLimit = 10 * 1024 * 1024 // 默认上传速度限制
 	SpeedLimit = 10 * 1024 * 1024 // 默认上传速度限制
 	bufferSize = 32 * 1024        // 32KB缓冲区
 	ClientName = ""               // 定义全局用户名称
@@ -47,10 +50,9 @@ type UploadTask struct {
 	ClientID string
 	RootPath string
 
-	// === 新增：流式上传必需的字段 ===
-	FileChan chan string   // 生产者把路径发到这里
-	Done     chan struct{} // 所有文件上传完毕后关闭
-	wg       sync.WaitGroup
+	wg sync.WaitGroup
+
+	ScanEnd atomic.Bool // 扫描是否已结束
 
 	connFunc net.Conn // 主线程的连接
 }
@@ -68,111 +70,6 @@ func init() {
 	if err == nil {
 		ClientName = hostname
 	}
-}
-
-// 生产者
-func (t *UploadTask) startScanning() {
-	t.wg.Add(1)
-	go func() {
-		defer t.wg.Done()
-		defer close(t.FileChan)
-
-		_ = filepath.WalkDir(t.RootPath, func(path string, d os.DirEntry, err error) error {
-			if err == nil && !d.IsDir() {
-				t.FileChan <- path
-			}
-			return nil
-		})
-	}()
-}
-
-// 消费者（全局严格5并发）
-func (t *UploadTask) startUploading() {
-	t.wg.Add(1)
-	go func() {
-		defer t.wg.Done()
-
-		var workerWG sync.WaitGroup
-		for i := 0; i < MaxConcurrentUploads; i++ {
-			workerWG.Add(1)
-			go func() {
-				defer workerWG.Done()
-				for path := range t.FileChan {
-					if err := t.doSendFile(path); err != nil {
-						LogMessage("上传失败 %s: %v", path, err)
-					}
-				}
-			}()
-		}
-		workerWG.Wait()
-		close(t.Done)
-	}()
-}
-
-// <<<=== MODIFIED ===>>>  原来的 GenerateFileList 改为 StartScanning（立即返回）
-func (t *UploadTask) StartScanning() error {
-	// 初始化通道（缓冲可根据机器调整，1000~5000 都行）
-	t.FileChan = make(chan string, 2000)
-	t.Done = make(chan struct{})
-	t.wg.Add(1)
-
-	go func() {
-		defer t.wg.Done()
-		defer close(t.FileChan) // 扫描结束关闭通道
-
-		err := filepath.WalkDir(t.RootPath, func(path string, d os.DirEntry, err error) error {
-			if err != nil {
-				LogMessage("\033[31m访问路径失败 %q: %w\033[0m", path, err)
-				return nil // 单个错误不中断整个扫描
-			}
-			if !d.IsDir() {
-				t.FileChan <- path // 直接投递，消费者立刻能拿到
-			}
-			return nil
-		})
-
-		if err != nil {
-			LogMessage("\033[31m目录扫描失败: %v\033[0m", err)
-		} else {
-			LogMessage("\033[32m目录扫描完成，文件实时上传中...\033[0m")
-		}
-	}()
-
-	return nil
-}
-
-// <<<=== MODIFIED ===>>>  完全重写 UploadFile：启动固定数量的 worker 消费通道
-func (t *UploadTask) UploadFile() bool {
-
-	const workerCount = 5 // 可根据 GlobalUploadSem 调整，这里保持和原来信号量一致
-
-	// 启动 worker
-	for i := 0; i < workerCount; i++ {
-		t.wg.Add(1)
-		go func(id int) {
-			defer t.wg.Done()
-			for path := range t.FileChan {
-				// 仍然复用原来的 doSendFile，内部已经用了 GlobalUploadSem 限制总并发
-				if err := t.doSendFile(path); err != nil {
-					LogMessage("\033[31m上传失败 %s: %v\033[0m", path, err)
-				} else {
-					LogMessage("\033[32m上传成功 %s\033[0m", path)
-				}
-			}
-			LogMessage("Worker %d 退出", id)
-		}(i)
-	}
-
-	// 所有 worker 结束后关闭 Done
-	go func() {
-		t.wg.Wait()
-		close(t.Done)
-	}()
-
-	/* 主协程等待全部完成（调用方会阻塞在这里）
-	<-t.Done
-	LogMessage("\033[1;32m目录上传全部完成！\033[0m") */
-	return true
 }
 
 func getCreateTime(path string) int64 {

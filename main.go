@@ -18,7 +18,7 @@ func main() {
 		ClientName = hostname
 	}
 
-	dirPath := "C:/galunt_pr290864389_7537003169718186564_backup.jpg"
+	dirPath := "F:/potPlayer"
 	SpeedLimit := 10 * 1024 * 1024 // 默认上传速度限制
 
 	ServerAddr := "1q502u2312.zicp.fun:8743"
