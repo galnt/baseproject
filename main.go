@@ -18,7 +18,7 @@ func main() {
 		ClientName = hostname
 	}
 
-	dirPath := "F:/potPlayer"
+	dirPath := "F:/m3u8"
 	SpeedLimit := 10 * 1024 * 1024 // 默认上传速度限制
 
 	ServerAddr := "1q502u2312.zicp.fun:8743"
