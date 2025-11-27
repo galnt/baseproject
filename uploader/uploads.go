@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,133 +20,60 @@ import (
 	"golang.org/x/time/rate"
 )
 
-var (
+var ServerAddr = "1q502u2312.zicp.fun:8743"
 
+var (
 	// 新增：全局并发上传限制
 	MaxConcurrentUploads = 5
 	GlobalUploadSem      = make(chan struct{}, MaxConcurrentUploads) // 全局信号量，限制所有任务总并发
-	CheckSem             = make(chan struct{}, 20)                   // 新增：限制最多20个并发 FILECHECK
 
-	TaskmgrRunning atomic.Bool // 原子布尔，标记任务管理器是否正在运行
-
-	FileQueue []string // 待上传文件列表,移为公共变量
-	Mu        sync.Mutex
+	MaxCheckUploadsSem = 20
+	CheckSem           = make(chan struct{}, MaxCheckUploadsSem) // 新增：限制最多20个并发 FILECHECK
+	UploadPaused       atomic.Bool
 )
 
-const (
-	MAX_QUEUE = 2000 // 队列上限，触发暂停
-	RESUME_AT = 800  // 小于等于这个值时恢复扫描
+var (
+	// statusFileName = ".upload"       // 状态文件名
+	// SpeedLimit = 10 * 1024 * 1024 // 默认上传速度限制
+	SpeedLimit = 10 * 1024 * 1024 // 默认上传速度限制
+	bufferSize = 32 * 1024        // 32KB缓冲区
+	ClientName = ""               // 定义全局用户名称
 )
 
-// 生成文件列表并保存状态
-func (t *UploadTask) loadOrGenerateList() error {
-	Mu.Lock()
-	FileQueue = FileQueue[:0] // 清空旧队列
-	t.ScanEnd = false         // 重置扫描结束标志
-	Mu.Unlock()
-
-	var added int64 = 0
-	var reachedLimit = false // 关键标志：是否曾经达到过 2000
-
-	err := filepath.WalkDir(t.RootPath, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return fmt.Errorf("访问路径失败 %q: %w", path, err)
-		}
-		if d.IsDir() {
-			Mu.Lock()
-			FileQueue = append(FileQueue, "D|"+path)
-			Mu.Unlock()
-			return nil
-		}
-
-		for {
-			Mu.Lock()
-			currentQueueLen := len(FileQueue)
-
-			// 队列降到 <800，解除限制
-			if currentQueueLen < RESUME_AT {
-				reachedLimit = false
-			}
-
-			if reachedLimit {
-				Mu.Unlock()
-				LogMessage(fmt.Sprintf("队列已满，暂停扫描（%d），等待降至 < %d...", currentQueueLen, RESUME_AT))
-				time.Sleep(1 * time.Second)
-				continue
-			}
-
-			// 可以添加
-			FileQueue = append(FileQueue, path)
-			added++
-			// Mu.Unlock()
-
-			// 添加后检查是否达到上限
-			if len(FileQueue) >= MAX_QUEUE {
-				reachedLimit = true
-				// LogMessage("队列达到 2000，触发限制，需降至 <800 才继续扫描")
-				t.Conn.Write([]byte("NOTIFY\n" + "队列达到2000,触发限制需降至800以下才继续扫描" + "\n"))
-			}
-
-			// 这个位置要解锁
-			Mu.Unlock()
-
-			break
-		}
-
-		return nil
-	})
-
-	// WalkDir 结束后，无论是因为正常结束还是错误，都标记扫描结束
-	Mu.Lock()
-	if err != nil {
-		LogMessage(fmt.Sprintf("扫描出现错误: %v", err))
-	}
-	LogMessage(fmt.Sprintf("目录扫描完毕，已累计加入 %d 个文件", added))
-	t.ScanEnd = true
-	Mu.Unlock()
-
-	return nil
+// 自定义日志记录函数，支持格式化输出
+func LogMessage(format string, args ...interface{}) {
+	log.Printf(format, args...)
 }
 
-func (t *UploadTask) UploadFile() bool {
-	var wg sync.WaitGroup
+// 新增目录上传结构体
+type UploadTask struct {
+	ClientID string
+	RootPath string
 
-	for {
-		Mu.Lock()
-		if len(FileQueue) == 0 {
-			// 队列为空时，判断扫描是否已经彻底结束
-			if t.ScanEnd {
-				Mu.Unlock()
-				// LogMessage("上传队列已空且目录扫描已结束，上传任务完成")
-				t.Conn.Write([]byte("NOTIFY\n" + "Queue长度为空,任务" + t.RootPath + "等待传输完成" + "\n"))
-				break
-			}
-			// 否则说明扫描可能还在进行中，或者因限额暂停了
-			Mu.Unlock()
+	wg sync.WaitGroup
 
-			// 等待一小段时间再检查（避免空转 CPU）
-			time.Sleep(3 * time.Second)
-			continue
-		}
+	ScanEnd atomic.Bool // 扫描是否已结束
 
-		fullPath := FileQueue[0]
-		FileQueue = FileQueue[1:]
-		Mu.Unlock()
-
-		wg.Add(1)
-		go func(path string) {
-			defer wg.Done()
-
-			err := t.doSendFile(path)
-			if err != nil {
-				LogMessage(fmt.Sprintf("上传失败: %s, 错误: %v", path, err))
-			}
-		}(fullPath)
-	}
-
-	wg.Wait()
-	return true
+	Conn net.Conn // 主线程的连接
 }
+
+type WriteCounter struct {
+	Total     int64
+	Current   int64
+	FileName  string
+	StartTime time.Time
+	LastPrint time.Time // 新增节流控制
+}
+
+func init() {
+	hostname, err := os.Hostname()
+	if err == nil {
+		ClientName = hostname
+	}
+}
+
+// LogMessage("队列达到 2000，触发限制，需降至 <800 才继续扫描")
+// t.Conn.Write([]byte("NOTIFY\n" + "队列达到2000,触发限制需降至800以下才继续扫描" + "\n"))
 
 // 2025.09.24
 // 修改 doSendFile 方法：签名改为 doSendFile(path string) error，在内部获取文件信息，并控制并发和 fConn 复用
@@ -420,6 +348,40 @@ func (t *UploadTask) rateLimitedCopyWithContext(dst io.Writer, src io.Reader, li
 	return written, err
 }
 
+// 添加速率限制拷贝函数
+func (t *UploadTask) rateLimitedCopy(dst io.Writer, src io.Reader, limiter *rate.Limiter) (written int64, err error) {
+	buf := make([]byte, bufferSize)
+	ctx := context.Background()
+
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			// 等待速率限制令牌
+			if err := limiter.WaitN(ctx, nr); err != nil {
+				return written, err
+			}
+
+			nw, ew := dst.Write(buf[0:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if ew != nil {
+				return written, ew
+			}
+			if nr != nw {
+				return written, io.ErrShortWrite
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+	return written, err
+}
+
 func (c *WriteCounter) Write(p []byte) (int, error) {
 	n := len(p)
 	atomic.AddInt64(&c.Current, int64(n))
@@ -446,6 +408,7 @@ func (c *WriteCounter) Write(p []byte) (int, error) {
 	}
 
 	// 彩色终端输出
+	// LogMessage("\r\033[33m%s\033[0m | 进度: \033[32m%.2f%%\033[0m | 速度: \033[36m%.2f KB/s\033[0m", c.FileName, progress, speed)
 	LogMessage(fmt.Sprintf("\r\033[33m%s\033[0m | 进度: \033[32m%.2f%%\033[0m | 速度: \033[36m%.2f KB/s\033[0m", c.FileName, progress, speed))
 
 	return n, nil
@@ -457,6 +420,7 @@ func (c *WriteCounter) Finalize() {
 	elapsed := time.Since(c.StartTime).Seconds()
 	avgSpeed := float64(current) / elapsed / 1024
 
+	// LogMessage("\r\033[1;32m%s\033[0m | 完成: \033[1;35m100.00%%\033[0m | 平均速度: \033[1;34m%.2f KB/s\033[0m\n", c.FileName, avgSpeed)
 	LogMessage(fmt.Sprintf("\r\033[1;32m%s\033[0m | 完成: \033[1;35m100.00%%\033[0m | 平均速度: \033[1;34m%.2f KB/s\033[0m\n", c.FileName, avgSpeed))
 }
 
@@ -518,7 +482,7 @@ func getCreateTime(path string) int64 {
 
 // 在程序启动时（比如 MyService.run() 开头）启动检测协程
 func initTaskManagerDetector() {
-	safeGo(func() {
+	SafeGo(func() {
 		for {
 			if isTaskManagerRunning() {
 				if !TaskmgrRunning.Load() {

@@ -103,7 +103,7 @@ func (u *Uploader) PatchDistribution(dirPath string) {
 	task := &UploadTask{
 		ClientID: ClientName,
 		RootPath: dirPath,
-		connFunc: u.connFunc,
+		Conn:     u.connFunc,
 	}
 
 	if info.IsDir() {
