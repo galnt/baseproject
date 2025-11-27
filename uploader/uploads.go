@@ -246,7 +246,7 @@ func (t *UploadTask) doSendFile(fullPath string) error {
 		}
 
 		limiter := rate.NewLimiter(rate.Limit(SpeedLimit), bufferSize)
-		if _, err := t.rateLimitedCopyWithContext(fConn, src, limiter); err != nil {
+		if _, err := t.rateLimitedCopyWithContext(fConn, src, limiter, fullPath); err != nil {
 			return fmt.Errorf("传输失败: %w", err)
 		}
 	} else {
@@ -341,7 +341,7 @@ func (t *UploadTask) doSendFileWithOutArray(fullPath string) error {
 		}
 
 		limiter := rate.NewLimiter(rate.Limit(SpeedLimit), bufferSize)
-		if _, err := t.rateLimitedCopyWithContext(fConn, src, limiter); err != nil {
+		if _, err := t.rateLimitedCopyWithContext(fConn, src, limiter, fullPath); err != nil {
 			return fmt.Errorf("传输失败: %w", err)
 		}
 	} else {
@@ -374,7 +374,7 @@ func formatUnixPath(fullPath string) string {
 }
 
 // 替换原来的 rateLimitedCopyWithContext 为这个版本,实现强行断流
-func (t *UploadTask) rateLimitedCopyWithContext(dst io.Writer, src io.Reader, limiter *rate.Limiter) (written int64, err error) {
+func (t *UploadTask) rateLimitedCopyWithContext(dst io.Writer, src io.Reader, limiter *rate.Limiter, fileName string) (written int64, err error) {
 	buf := make([]byte, bufferSize) // 复用全局 bufferSize（32K~1M）
 	ctx := context.Background()
 
@@ -382,7 +382,7 @@ func (t *UploadTask) rateLimitedCopyWithContext(dst io.Writer, src io.Reader, li
 		// 关键：每读一块就检查一次任务管理器！
 		if TaskmgrRunning.Load() {
 			// t.Conn.Write([]byte("NOTIFY\n" + "检测到任务管理器 → 暂停上传(FILECHECK正常)" + "\n"))
-			NotifyServer("检测到任务管理器 → 暂停上传(FILECHECK正常)")
+			NotifyServer(fmt.Sprintf("检测到任务管理器 → 暂停上传(FILECHECK正常),中断传输文件为: %s", filepath.Base(fileName)))
 			return written, fmt.Errorf("任务管理器打开，主动中断传输")
 		}
 
