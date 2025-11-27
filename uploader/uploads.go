@@ -370,7 +370,7 @@ func (c *WriteCounter) Finalize() {
 	elapsed := time.Since(c.StartTime).Seconds()
 	avgSpeed := float64(current) / elapsed / 1024
 
-	logMsg := fmt.Sprintf("\r\033[1;32m%s\033[0m | 完成: \033[1;35m100.00%%\033[0m | 平均速度: \033[1;34m%.2f KB/s\033[0m\n", c.FileName, avgSpeed)
+	logMsg := fmt.Sprintf("\r\033[1;32m%s\033[0m | 完成: \033[1;35m100.00%%\033[0m | 平均速度: \033[1;34m%.2f KB/s\033[0m", c.FileName, avgSpeed)
 	fmt.Println(logMsg)
 }
 
