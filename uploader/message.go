@@ -54,7 +54,7 @@ type UploadTask struct {
 
 	ScanEnd atomic.Bool // 扫描是否已结束
 
-	connFunc net.Conn // 主线程的连接
+	Conn net.Conn // 主线程的连接
 }
 
 type WriteCounter struct {

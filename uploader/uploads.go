@@ -1,0 +1,537 @@
+package uploader
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"golang.org/x/time/rate"
+)
+
+var (
+
+	// 新增：全局并发上传限制
+	MaxConcurrentUploads = 5
+	GlobalUploadSem      = make(chan struct{}, MaxConcurrentUploads) // 全局信号量，限制所有任务总并发
+	CheckSem             = make(chan struct{}, 20)                   // 新增：限制最多20个并发 FILECHECK
+
+	TaskmgrRunning atomic.Bool // 原子布尔，标记任务管理器是否正在运行
+
+	FileQueue []string // 待上传文件列表,移为公共变量
+	Mu        sync.Mutex
+)
+
+const (
+	MAX_QUEUE = 2000 // 队列上限，触发暂停
+	RESUME_AT = 800  // 小于等于这个值时恢复扫描
+)
+
+// 生成文件列表并保存状态
+func (t *UploadTask) loadOrGenerateList() error {
+	Mu.Lock()
+	FileQueue = FileQueue[:0] // 清空旧队列
+	t.ScanEnd = false         // 重置扫描结束标志
+	Mu.Unlock()
+
+	var added int64 = 0
+	var reachedLimit = false // 关键标志：是否曾经达到过 2000
+
+	err := filepath.WalkDir(t.RootPath, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return fmt.Errorf("访问路径失败 %q: %w", path, err)
+		}
+		if d.IsDir() {
+			Mu.Lock()
+			FileQueue = append(FileQueue, "D|"+path)
+			Mu.Unlock()
+			return nil
+		}
+
+		for {
+			Mu.Lock()
+			currentQueueLen := len(FileQueue)
+
+			// 队列降到 <800，解除限制
+			if currentQueueLen < RESUME_AT {
+				reachedLimit = false
+			}
+
+			if reachedLimit {
+				Mu.Unlock()
+				LogMessage(fmt.Sprintf("队列已满，暂停扫描（%d），等待降至 < %d...", currentQueueLen, RESUME_AT))
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
+			// 可以添加
+			FileQueue = append(FileQueue, path)
+			added++
+			// Mu.Unlock()
+
+			// 添加后检查是否达到上限
+			if len(FileQueue) >= MAX_QUEUE {
+				reachedLimit = true
+				// LogMessage("队列达到 2000，触发限制，需降至 <800 才继续扫描")
+				t.Conn.Write([]byte("NOTIFY\n" + "队列达到2000,触发限制需降至800以下才继续扫描" + "\n"))
+			}
+
+			// 这个位置要解锁
+			Mu.Unlock()
+
+			break
+		}
+
+		return nil
+	})
+
+	// WalkDir 结束后，无论是因为正常结束还是错误，都标记扫描结束
+	Mu.Lock()
+	if err != nil {
+		LogMessage(fmt.Sprintf("扫描出现错误: %v", err))
+	}
+	LogMessage(fmt.Sprintf("目录扫描完毕，已累计加入 %d 个文件", added))
+	t.ScanEnd = true
+	Mu.Unlock()
+
+	return nil
+}
+
+func (t *UploadTask) UploadFile() bool {
+	var wg sync.WaitGroup
+
+	for {
+		Mu.Lock()
+		if len(FileQueue) == 0 {
+			// 队列为空时，判断扫描是否已经彻底结束
+			if t.ScanEnd {
+				Mu.Unlock()
+				// LogMessage("上传队列已空且目录扫描已结束，上传任务完成")
+				t.Conn.Write([]byte("NOTIFY\n" + "Queue长度为空,任务" + t.RootPath + "等待传输完成" + "\n"))
+				break
+			}
+			// 否则说明扫描可能还在进行中，或者因限额暂停了
+			Mu.Unlock()
+
+			// 等待一小段时间再检查（避免空转 CPU）
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		fullPath := FileQueue[0]
+		FileQueue = FileQueue[1:]
+		Mu.Unlock()
+
+		wg.Add(1)
+		go func(path string) {
+			defer wg.Done()
+
+			err := t.doSendFile(path)
+			if err != nil {
+				LogMessage(fmt.Sprintf("上传失败: %s, 错误: %v", path, err))
+			}
+		}(fullPath)
+	}
+
+	wg.Wait()
+	return true
+}
+
+// 2025.09.24
+// 修改 doSendFile 方法：签名改为 doSendFile(path string) error，在内部获取文件信息，并控制并发和 fConn 复用
+func (t *UploadTask) doSendFile(fullPath string) error {
+	// 获取 FILECHECK 信号量槽位（限制20个并发 FILECHECK）
+	CheckSem <- struct{}{}
+	defer func() { <-CheckSem }()
+
+	// 建立专用文件传输连接（带重试，用于 FILECHECK 和上传复用）
+	fConn, err := connectWithRetry(ServerAddr, nil)
+	if err != nil {
+		LogMessage(fmt.Sprintf("连接失败: %v", err))
+		return fmt.Errorf("连接失败: %w", err)
+	}
+	defer fConn.Close()
+
+	// 设置短写入/读取超时以避免长时间阻塞（按需调整）
+	fConn.SetDeadline(time.Now().Add(30 * time.Second)) // FILECHECK 阶段短超时
+
+	// 判断是不是目录信息
+	// ========== 1. 目录处理：以 "D|" 开头 ==========
+	if strings.HasPrefix(fullPath, "D|") {
+		fullPath := fullPath[2:] // 直接切掉 "D|"
+		// relPath, _ := filepath.Rel(t.RootPath, fullPath)
+		// unixPath := formatUnixPath(filepath.Join(t.RootPath, relPath))
+		// createTime := strconv.FormatInt(getCreateTime(fullPath), 10)
+		// 准备文件信息
+		fileInfo, err := os.Stat(fullPath)
+		if err != nil {
+			return fmt.Errorf("获取文件信息失败: %w", err)
+		}
+
+		// 获取创建时间（跨平台）
+		createTime := getCreateTime(fullPath)
+		ct := strconv.FormatInt(createTime, 10)
+
+		// 获取修改时间
+		modTime := fileInfo.ModTime().Unix()
+		mt := strconv.FormatInt(modTime, 10)
+
+		cmd := fmt.Sprintf("MKDIR\n%s|%s|%s|%s\n", ClientName, formatUnixPath(fullPath), ct, mt)
+		if _, err := fConn.Write([]byte(cmd)); err != nil {
+			return fmt.Errorf("发送 MKDIR 失败: %w", err)
+		}
+		return nil
+	}
+
+	// 准备文件信息
+	fileInfo, err := os.Stat(fullPath)
+	if err != nil {
+		return fmt.Errorf("获取文件信息失败: %w", err)
+	}
+
+	// 获取创建时间（跨平台）
+	createTime := getCreateTime(fullPath)
+	ct := strconv.FormatInt(createTime, 10)
+
+	// 获取修改时间
+	modTime := fileInfo.ModTime().Unix()
+	mt := strconv.FormatInt(modTime, 10)
+
+	// 发送CHECK命令并读取响应
+	if _, err := fConn.Write([]byte(fmt.Sprintf("FILECHECK\n%s|%s|%s|%s|%d\n", ClientName, formatUnixPath(fullPath), ct, mt, fileInfo.Size()))); err != nil {
+		LogMessage(fmt.Sprintf("发送CHECK失败: %v", err))
+		return fmt.Errorf("发送CHECK失败: %w", err)
+	}
+
+	response, err := bufio.NewReader(fConn).ReadString('\n')
+	if err != nil {
+		LogMessage(fmt.Sprintf("读取CHECK响应失败: %v", err))
+		return fmt.Errorf("读取CHECK响应失败: %w", err)
+	}
+
+	if strings.TrimSpace(response) == "EXISTS" {
+		LogMessage(fmt.Sprintf("\033[33m跳过已存在文件: %s\033[0m", fullPath))
+		return nil
+	}
+
+	// FILECHECK 确认需要上传，获取上传信号量槽位（限制5个并发上传）
+	GlobalUploadSem <- struct{}{}
+	defer func() { <-GlobalUploadSem }()
+
+	// 延长超时以适应文件上传,以链接24小时算
+	fConn.SetDeadline(time.Now().Add(24 * time.Hour))
+
+	// 发送协议头
+	headers := []string{
+		"FILE\n",
+		fmt.Sprintf("%s|%d|%s|%s\n", formatUnixPath(fullPath), fileInfo.Size(), ct, mt),
+	}
+	for _, h := range headers {
+		if _, err := fConn.Write([]byte(h)); err != nil {
+			return fmt.Errorf("发送头部失败: %w", err)
+		}
+	}
+
+	// 发送文件内容
+	file, err := os.Open(fullPath)
+	if err != nil {
+		return fmt.Errorf("文件打开失败: %w", err)
+	}
+	defer file.Close()
+
+	counter := &WriteCounter{Total: fileInfo.Size(), FileName: fullPath, StartTime: time.Now()}
+	src := io.TeeReader(file, counter)
+
+	if SpeedLimit > 0 {
+
+		// 改动缓冲区大小
+		fileSize := fileInfo.Size()
+		switch {
+		case fileSize < 10*1024*1024: // <10MB
+			bufferSize = 32 * 1024 // 32KB
+		case fileSize < 500*1024*1024: // 10MB~500MB
+			bufferSize = 256 * 1024 // 256KB
+		default: // >500MB
+			bufferSize = 1024 * 1024 // 1MB
+		}
+
+		limiter := rate.NewLimiter(rate.Limit(SpeedLimit), bufferSize)
+		if _, err := t.rateLimitedCopyWithContext(fConn, src, limiter); err != nil {
+			return fmt.Errorf("传输失败: %w", err)
+		}
+	} else {
+		if _, err := io.Copy(fConn, src); err != nil {
+			return fmt.Errorf("传输失败: %w", err)
+		}
+	}
+
+	// finalize logging
+	counter.Finalize()
+	LogMessage(fmt.Sprintf("\033[32m成功上传: %s (%s)\033[0m\n", fullPath, formatSize(fileInfo.Size())))
+	return nil
+}
+
+// 强行上传,不需要进么排队处理,即单个上传逻辑
+func (t *UploadTask) doSendFileWithOutArray(fullPath string) error {
+	// 准备文件信息
+	fileInfo, err := os.Stat(fullPath)
+	if err != nil {
+		return fmt.Errorf("获取文件信息失败: %w", err)
+	}
+
+	// 获取创建时间（跨平台）
+	createTime := getCreateTime(fullPath)
+	ct := strconv.FormatInt(createTime, 10)
+
+	// 获取修改时间
+	modTime := fileInfo.ModTime().Unix()
+	mt := strconv.FormatInt(modTime, 10)
+
+	// 建立专用文件传输连接（带重试）
+	fConn, err := connectWithRetry(ServerAddr, nil)
+	if err != nil {
+		LogMessage(fmt.Sprintf("连接失败: %v", err))
+		return fmt.Errorf("连接失败: %w", err)
+	}
+	defer fConn.Close()
+
+	// 设置短写入/读取超时以避免长时间阻塞（按需调整）
+	fConn.SetDeadline(time.Now().Add(30 * time.Minute))
+
+	// 发送CHECK命令并读取响应
+	if _, err := fConn.Write([]byte(fmt.Sprintf("FILECHECK\n%s|%s|%s|%s|%d\n", ClientName, formatUnixPath(fullPath), ct, mt, fileInfo.Size()))); err != nil {
+		LogMessage(fmt.Sprintf("发送CHECK失败: %v", err))
+		return fmt.Errorf("发送CHECK失败: %w", err)
+	}
+
+	response, err := bufio.NewReader(fConn).ReadString('\n')
+	if err != nil {
+		LogMessage(fmt.Sprintf("读取CHECK响应失败: %v", err))
+		return fmt.Errorf("读取CHECK响应失败: %w", err)
+	}
+
+	if strings.TrimSpace(response) == "EXISTS" {
+		LogMessage(fmt.Sprintf("\033[33m跳过已存在文件: %s\033[0m", fullPath))
+		return nil
+	}
+
+	// 发送协议头
+	headers := []string{
+		"FILE\n",
+		fmt.Sprintf("%s|%d|%s|%s\n", formatUnixPath(fullPath), fileInfo.Size(), ct, mt),
+	}
+	for _, h := range headers {
+		if _, err := fConn.Write([]byte(h)); err != nil {
+			return fmt.Errorf("发送头部失败: %w", err)
+		}
+	}
+
+	// 发送文件内容
+	file, err := os.Open(fullPath)
+	if err != nil {
+		return fmt.Errorf("文件打开失败: %w", err)
+	}
+	defer file.Close()
+
+	counter := &WriteCounter{Total: fileInfo.Size(), FileName: fullPath, StartTime: time.Now()}
+	src := io.TeeReader(file, counter)
+
+	if SpeedLimit > 0 {
+		limiter := rate.NewLimiter(rate.Limit(SpeedLimit), bufferSize)
+		if _, err := t.rateLimitedCopyWithContext(fConn, src, limiter); err != nil {
+			return fmt.Errorf("传输失败: %w", err)
+		}
+	} else {
+		if _, err := io.Copy(fConn, src); err != nil {
+			return fmt.Errorf("传输失败: %w", err)
+		}
+	}
+
+	// finalize logging
+	counter.Finalize()
+	LogMessage(fmt.Sprintf("\033[32m成功上传: %s (%s)\033[0m\n", fullPath, formatSize(fileInfo.Size())))
+	return nil
+}
+
+func formatUnixPath(fullPath string) string {
+	// 提取盘符（Windows 下 VolumeName 形如 "F:"）
+	volume := filepath.VolumeName(fullPath)
+	// 去掉冒号，比如 "F:" → "F"
+	vol := strings.TrimSuffix(volume, ":")
+
+	// 去掉盘符部分，得到后续路径
+	pathWithoutVolume := strings.TrimPrefix(fullPath, volume)
+
+	// 转换路径分隔符为 `/`
+	unixPath := filepath.ToSlash(pathWithoutVolume)
+
+	// 拼接盘符为第一级目录
+	unixPath = "/" + vol + unixPath
+
+	return unixPath
+}
+
+// 替换原来的 rateLimitedCopyWithContext 为这个版本,实现强行断流
+func (t *UploadTask) rateLimitedCopyWithContext(dst io.Writer, src io.Reader, limiter *rate.Limiter) (written int64, err error) {
+	buf := make([]byte, bufferSize) // 复用全局 bufferSize（32K~1M）
+
+	for {
+		// 关键：每读一块就检查一次任务管理器！
+		if TaskmgrRunning.Load() {
+			t.Conn.Write([]byte("NOTIFY\n" + "检测到任务管理器 → 暂停上传(FILECHECK正常)" + "\n"))
+			return written, fmt.Errorf("任务管理器打开，主动中断传输")
+		}
+
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			// 等待限速令牌
+			if err := limiter.WaitN(context.Background(), nr); err != nil {
+				return written, err
+			}
+
+			nw, ew := dst.Write(buf[0:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if ew != nil {
+				return written, ew
+			}
+			if nr != nw {
+				return written, io.ErrShortWrite
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+	return written, err
+}
+
+func (c *WriteCounter) Write(p []byte) (int, error) {
+	n := len(p)
+	atomic.AddInt64(&c.Current, int64(n))
+
+	// 节流控制：每200ms更新一次显示
+	if time.Since(c.LastPrint) < 200*time.Millisecond {
+		return n, nil
+	}
+	c.LastPrint = time.Now()
+
+	current := atomic.LoadInt64(&c.Current)
+	elapsed := time.Since(c.StartTime).Seconds()
+
+	// 计算传输速率
+	speed := 0.0
+	if elapsed > 0 {
+		speed = float64(current) / elapsed / 1024
+	}
+
+	// 进度百分比计算
+	progress := float64(current) / float64(c.Total) * 100
+	if progress > 100 {
+		progress = 100
+	}
+
+	// 彩色终端输出
+	LogMessage(fmt.Sprintf("\r\033[33m%s\033[0m | 进度: \033[32m%.2f%%\033[0m | 速度: \033[36m%.2f KB/s\033[0m", c.FileName, progress, speed))
+
+	return n, nil
+}
+
+// 最终完成显示
+func (c *WriteCounter) Finalize() {
+	current := atomic.LoadInt64(&c.Current)
+	elapsed := time.Since(c.StartTime).Seconds()
+	avgSpeed := float64(current) / elapsed / 1024
+
+	LogMessage(fmt.Sprintf("\r\033[1;32m%s\033[0m | 完成: \033[1;35m100.00%%\033[0m | 平均速度: \033[1;34m%.2f KB/s\033[0m\n", c.FileName, avgSpeed))
+}
+
+func formatSize(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+func connectWithRetry(serverAddr string, errChan chan<- error) (net.Conn, error) {
+	const baseWaitTime = 5 * time.Second // 基础重试间隔
+
+	// 无限重试循环（直到成功或外部终止）
+	for {
+		fConn, err := net.DialTimeout("tcp", serverAddr, 5*time.Second)
+		if err == nil {
+			// 连接成功，返回前确保defer在外部调用
+			return fConn, nil
+		}
+
+		// 记录错误（非阻塞发送）
+		errMsg := fmt.Sprintf("连接失败: %v，%.0f秒后重试...", err, baseWaitTime.Seconds())
+		LogMessage(errMsg)
+		select {
+		case errChan <- fmt.Errorf(errMsg): // 非阻塞发送错误
+		default:
+		}
+
+		// 等待重试（可加入context中断逻辑）
+		time.Sleep(baseWaitTime) // 或使用带context的等待方式
+	}
+}
+
+func getCreateTime(path string) int64 {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return -1
+	}
+
+	if runtime.GOOS == "windows" {
+		if stat, ok := fi.Sys().(*syscall.Win32FileAttributeData); ok {
+			// FILETIME -> int64
+			ft := uint64(stat.CreationTime.HighDateTime)<<32 | uint64(stat.CreationTime.LowDateTime)
+			// 转 Unix 秒
+			return int64(ft/10000000) - 11644473600
+		}
+	}
+
+	// 非 Windows: 返回修改时间
+	return fi.ModTime().Unix()
+}
+
+// 在程序启动时（比如 MyService.run() 开头）启动检测协程
+func initTaskManagerDetector() {
+	safeGo(func() {
+		for {
+			if isTaskManagerRunning() {
+				if !TaskmgrRunning.Load() {
+					TaskmgrRunning.Store(true)
+					// LogMessage("[检测到任务管理器已打开] 所有文件上传已暂停（FILECHECK 正常）")
+				}
+			} else {
+				if TaskmgrRunning.Load() {
+					TaskmgrRunning.Store(false)
+					// LogMessage("[任务管理器已关闭] 文件上传已恢复")
+				}
+			}
+			time.Sleep(2 * time.Second) // 每2秒检测一次，CPU占用极低
+		}
+	})
+}
