@@ -95,7 +95,7 @@ func SafeGo(fn func()) {
 // 程序分发入口
 func (u *Uploader) PatchDistribution(dirPath string) {
 
-	StartTaskManagerDetector(u.connFunc)
+	// StartTaskManagerDetector(u.connFunc)
 
 	// 检查路径是文件还是目录
 	info, err := os.Stat(dirPath)

