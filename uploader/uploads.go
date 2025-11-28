@@ -123,13 +123,6 @@ func (t *UploadTask) doSendFile(fullPath string) error {
 	CheckSem <- struct{}{}
 	defer func() { <-CheckSem }()
 
-	/* 建立专用文件传输连接（带重试，用于 FILECHECK 和上传复用）
-	fConn, err := connectWithRetry(ServerAddr, nil)
-	if err != nil {
-		return fmt.Errorf("连接失败: %w", err)
-	}
-	defer fConn.Close()*/
-
 	// 使用连接池获取一条短连接
 	fConn := getPooledConn()
 	defer putPooledConn(fConn)

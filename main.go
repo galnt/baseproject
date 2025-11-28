@@ -34,7 +34,7 @@ func main() {
 	uploader.StartTaskManagerDetector() // 任务管理器检测（sync.Once）
 
 	// 改成你想上传的目录或文件
-	u.PatchDistribution("F:/m3u8")
+	u.PatchDistribution("D:/bcompare")
 
 	u.PatchDistribution("E:/galunt_758127181@chatroom_-363328172_backupnull.jpg")
 

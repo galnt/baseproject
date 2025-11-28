@@ -69,23 +69,6 @@ type Uploader struct {
 }
 
 func init() {
-	// 全局初始化一次
-	// GlobalFileQueue = make(chan FileQueueTask, 2000) // 全局缓冲2000
-	// startGlobalWorkers() // 程序启动时就启动20个worker
-
-	/* 在 main 或 init 中启动
-	go func() {
-		ticker := time.NewTicker(3 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			pending := PendingFiles.Load()
-			if pending > 0 || atomic.LoadInt32(&ActiveUploadTasks) > 0 {
-				logMsg := fmt.Sprintf("\033[36m[全局进度] 待上传文件: %d | 活跃扫描任务: %d\033[0m", pending, atomic.LoadInt32(&ActiveUploadTasks))
-				fmt.Println(logMsg)
-			}
-		}
-	}()*/
-
 	// 全局初始化逻辑现在只包含定时打印全局进度
 	go func() {
 		ticker := time.NewTicker(3 * time.Second)
@@ -95,8 +78,7 @@ func init() {
 			activeTasks := ActiveUploadTasks.Load()
 			if pending > 0 || activeTasks > 0 {
 				// 打印全局进度信息
-				logMsg := fmt.Sprintf("\033[36m[全局进度] 待上传文件: %d | 活跃扫描任务: %d\033[0m", pending, activeTasks)
-				fmt.Println(logMsg)
+				NotifyServer(fmt.Sprintf("\033[36m[全局进度] 待上传文件: %d | 活跃扫描任务: %d\033[0m", pending, activeTasks))
 			}
 		}
 	}()
@@ -152,6 +134,9 @@ func (u *Uploader) PatchDistribution(dirPath string) {
 		task.StartWorkers()  // 先启动 Worker 消费队列
 		task.StartScanning() // 再启动扫描生产队列
 		task.StartReporter() // 启动队列长度报告
+
+		// *** 关键修改：在这里调用 Wait，阻塞直到整个任务完成 ***
+		task.Wait()
 	} else {
 		task.doSendFileWithOutArray(dirPath)
 	}
@@ -171,32 +156,6 @@ func (t *UploadTask) StartWorkers() {
 	}
 }
 
-/* 启动全局消费者
-func startGlobalWorkers() {
-	if atomic.CompareAndSwapInt32(&GlobalUploadWorkers, 0, 1) {
-		for i := 0; i < MaxConcurrentUploads; i++ {
-			GlobalWorkerWG.Add(1)
-			go func(workerID int) {
-				defer GlobalWorkerWG.Done()
-				for {
-					select {
-					case ft, ok := <-GlobalFileQueue:
-						if !ok {
-							return
-						}
-
-						PendingFiles.Add(-1) // 取出就-1
-
-						_ = ft.Task.doSendFile(ft.Path) // 直接复用原来的上传逻辑
-					case <-GlobalWorkerShutdown:
-						return
-					}
-				}
-			}(i)
-		}
-	}
-}*/
-
 // 启动扫描 → 只负责把文件扔进全局队列
 func (t *UploadTask) StartScanning() {
 	ActiveUploadTasks.Add(1) // 活跃扫描任务 +1
@@ -210,7 +169,7 @@ func (t *UploadTask) StartScanning() {
 
 			close(t.FileQueue) // 扫描完成，关闭任务队列
 			// 发送扫描完成通知
-			NotifyServer(fmt.Sprintf("\033[32m目录扫描完成: %s\033[0m", t.RootPath))
+			NotifyServer(fmt.Sprintf("\033[32m目录%s扫描完成\033[0m", t.RootPath))
 		}()
 
 		err := filepath.WalkDir(t.RootPath, func(path string, d os.DirEntry, err error) error {
@@ -270,29 +229,5 @@ func (t *UploadTask) Wait() {
 	t.workerWG.Wait() // 等待所有 Worker 退出 (FileQueue 被关闭)
 
 	// 发送任务全部完成通知
-	NotifyServer(fmt.Sprintf("\033[1;32m任务全部完成: %s\033[0m", t.RootPath))
+	NotifyServer(fmt.Sprintf("\033[1;32m任务%s全部完成\033[0m", t.RootPath))
 }
-
-/* 等待当前任务彻底结束（扫描完 + 该任务的所有文件都上传完）
-func (t *UploadTask) Wait() {
-	t.wg.Wait()
-
-	// 辅助等待：如果队列里还有本任务的文件，也要等
-	for {
-		if t.ScanEnd.Load() &&
-			atomic.LoadInt32(&ActiveUploadTasks) == 0 &&
-			PendingFiles.Load() == 0 {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	// logMsg :=
-	t.Conn.Write([]byte("NOTIFY\n" + fmt.Sprintf("\033[1;32m任务全部完成: %s\033[0m", t.RootPath) + "\n"))
-}*/
-
-/* 当程序退出时调用（可选）
-func ShutdownGlobalWorkers() {
-	close(GlobalWorkerShutdown)
-	GlobalWorkerWG.Wait()
-	close(GlobalFileQueue)
-}*/
