@@ -63,7 +63,7 @@ func InitCheckConnPool() error {
 		}
 
 		// 可选：预热 8 条短连接，让第一次 FILECHECK 几乎无延迟
-		for i := 0; i < 10; i++ {
+		for i := 0; i < 25; i++ {
 			if c := checkConnPool.Get(); c != nil {
 				if conn, ok := c.(net.Conn); ok && conn != nil {
 					checkConnPool.Put(conn)

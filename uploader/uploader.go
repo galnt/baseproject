@@ -127,7 +127,7 @@ func (u *Uploader) PatchDistribution(dirPath string) {
 		RootPath:  dirPath,
 		Conn:      u.connFunc,
 		FileQueue: make(chan FileQueueTask, TaskQueueSize), // 初始化任务独有队列
-		workers:   MaxConcurrentUploads,                    // 从全局配置获取 worker 数量
+		workers:   MaxCheckUploadsSem,                      // 从全局配置获取 worker 数量
 	}
 
 	if info.IsDir() {
@@ -142,7 +142,7 @@ func (u *Uploader) PatchDistribution(dirPath string) {
 	}
 }
 
-// 启动任务独有的消费者 Workers (Worker 数量由 MaxConcurrentUploads 决定)
+// 启动任务独有的消费者 Workers (Worker 数量由 FILECHECK 决定,所以基本是按20算)
 func (t *UploadTask) StartWorkers() {
 	for i := 0; i < t.workers; i++ {
 		t.workerWG.Add(1)
