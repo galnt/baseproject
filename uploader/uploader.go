@@ -71,7 +71,7 @@ type Uploader struct {
 func init() {
 	// 全局初始化逻辑现在只包含定时打印全局进度
 	go func() {
-		ticker := time.NewTicker(3 * time.Second)
+		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
 			pending := PendingFiles.Load()
