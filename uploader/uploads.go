@@ -56,13 +56,18 @@ func InitCheckConnPool() error {
 				// 不要 panic，让调用方稍后自动重试
 				return nil
 			}
+
+			// 在这里发送一个身份ID,这个SETUUID会在后端记录一个标识clientID,用于会话标识那个用户处理
+			conn.Write([]byte("SETUUID\n" + ClientName + "\n"))
 			return conn
 		}
 
 		// 可选：预热 8 条短连接，让第一次 FILECHECK 几乎无延迟
-		for i := 0; i < 8; i++ {
-			if c := checkConnPool.Get().(net.Conn); c != nil {
-				checkConnPool.Put(c)
+		for i := 0; i < 10; i++ {
+			if c := checkConnPool.Get(); c != nil {
+				if conn, ok := c.(net.Conn); ok && conn != nil {
+					checkConnPool.Put(conn)
+				}
 			}
 		}
 	})
@@ -75,6 +80,8 @@ func getPooledConn() net.Conn {
 		obj := checkConnPool.Get()
 		if obj == nil {
 			// 第一次使用或连接创建失败时触发 New()
+			// 注意：checkConnPool.New() 在 InitCheckConnPool 中被设置
+			// 这里调用 Get() 如果返回 nil，说明池中没有，且 New() 初始设置为返回 nil，所以需要再次调用 New 逻辑
 			obj = checkConnPool.New()
 		}
 		if conn, ok := obj.(net.Conn); ok && conn != nil {
@@ -92,20 +99,6 @@ func putPooledConn(c net.Conn) {
 	}
 	c.SetDeadline(time.Time{}) // 清除 deadline，防止影响下一次使用
 	checkConnPool.Put(c)
-}
-
-// =====================================================================
-
-// 新增目录上传结构体
-type UploadTask struct {
-	ClientID string
-	RootPath string
-
-	wg sync.WaitGroup
-
-	ScanEnd atomic.Bool // 扫描是否已结束
-
-	Conn net.Conn // 主控连接，用于 NOTIFY、日志等
 }
 
 type WriteCounter struct {
