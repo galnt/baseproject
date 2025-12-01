@@ -127,7 +127,7 @@ func (u *Uploader) PatchDistribution(dirPath string) {
 		RootPath:  dirPath,
 		Conn:      u.connFunc,
 		FileQueue: make(chan FileQueueTask, TaskQueueSize), // 初始化任务独有队列
-		workers:   MaxCheckUploadsSem,                      // 从全局配置获取 worker 数量
+		workers:   MaxCheckUploadsSem - 2,                  // 从全局配置获取 worker 数量
 	}
 
 	if info.IsDir() {
