@@ -173,6 +173,7 @@ func (t *UploadTask) StartScanning() {
 			NotifyServer(fmt.Sprintf("\033[32m目录%s扫描完成\033[0m", t.RootPath))
 		}()
 
+		NotifyServer(fmt.Sprintf("\033[1;32m任务-------------------------------%s------------------------------------------------------------开始扫描\033[0m", t.RootPath))
 		err := filepath.WalkDir(t.RootPath, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
 				logMsg := fmt.Sprintf("\033[31m访问路径失败 %q: %w\033[0m", path, err)
