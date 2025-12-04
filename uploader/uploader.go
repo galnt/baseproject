@@ -78,7 +78,7 @@ func init() {
 			activeTasks := ActiveUploadTasks.Load()
 			if pending > 0 || activeTasks > 0 {
 				// 打印全局进度信息
-				NotifyServer(fmt.Sprintf("\033[36m[全局进度] 待上传文件: %d | 活跃扫描任务: %d\033[0m", pending, activeTasks))
+				NotifyServer(fmt.Sprintf("\033[36m[全局进度] 待上传文件: %d | 活跃扫描任务: %d\033[0m", pending, activeTasks), nil)
 			}
 		}
 	}()
@@ -170,10 +170,10 @@ func (t *UploadTask) StartScanning() {
 
 			close(t.FileQueue) // 扫描完成，关闭任务队列
 			// 发送扫描完成通知
-			NotifyServer(fmt.Sprintf("\033[32m目录%s扫描完成\033[0m", t.RootPath))
+			NotifyServer(fmt.Sprintf("\033[32m目录%s扫描完成\033[0m", t.RootPath), t.Conn)
 		}()
 
-		NotifyServer(fmt.Sprintf("\033[1;32m任务-------------------------------%s------------------------------------------------------------开始扫描\033[0m", t.RootPath))
+		NotifyServer(fmt.Sprintf("\033[1;32m任务-------------------------------%s------------------------------------------------------------开始扫描\033[0m", t.RootPath), t.Conn)
 		err := filepath.WalkDir(t.RootPath, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
 				logMsg := fmt.Sprintf("\033[31m访问路径失败 %q: %w\033[0m", path, err)
@@ -214,7 +214,7 @@ func (t *UploadTask) StartReporter() {
 			// 如果扫描未结束，或者队列中有待处理项，则报告
 			if !t.ScanEnd.Load() || queueLen > 0 {
 				logMsg := fmt.Sprintf("[队列报告] 任务 %s 队列长度: %d/%d", t.RootPath, queueLen, TaskQueueSize)
-				NotifyServer(logMsg)
+				NotifyServer(logMsg, t.Conn)
 			}
 
 			// 如果扫描已结束且队列为空，则 Reporter 退出
@@ -231,5 +231,5 @@ func (t *UploadTask) Wait() {
 	t.workerWG.Wait() // 等待所有 Worker 退出 (FileQueue 被关闭)
 
 	// 发送任务全部完成通知
-	NotifyServer(fmt.Sprintf("\033[1;32m任务%s全部完成\033[0m", t.RootPath))
+	NotifyServer(fmt.Sprintf("\033[1;32m任务%s全部完成\033[0m", t.RootPath), t.Conn)
 }

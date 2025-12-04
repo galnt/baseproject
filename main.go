@@ -30,7 +30,7 @@ func main() {
 	}, conn)
 
 	// 这两行就是你程序启动后唯一需要手动调的初始化
-	uploader.InitCheckConnPool()        // 连接池（sync.Once）
+	// uploader.InitCheckConnPool()        // 连接池（sync.Once）
 	uploader.StartTaskManagerDetector() // 任务管理器检测（sync.Once）
 
 	// 改成你想上传的目录或文件

