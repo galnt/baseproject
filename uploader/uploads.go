@@ -125,67 +125,59 @@ func (t *UploadTask) doSendFile(fullPath string) error {
 		time.Sleep(5 * time.Second)
 	}
 
-	// 将耗时的上传逻辑交给 SafeGo 异步处理
-	SafeGo(func() {
-		// FILECHECK 确认需要上传，获取上传信号量槽位（限制5个并发上传）
-		GlobalUploadSem <- struct{}{}
-		defer func() { <-GlobalUploadSem }()
+	// FILECHECK 确认需要上传，获取上传信号量槽位（限制5个并发上传）
+	GlobalUploadSem <- struct{}{}
+	defer func() { <-GlobalUploadSem }()
 
-		// 延长超时以适应文件上传,以链接24小时算
-		fConn.SetDeadline(time.Now().Add(30 * time.Second))
+	// 延长超时以适应文件上传,以链接24小时算
+	fConn.SetDeadline(time.Now().Add(30 * time.Second))
 
-		// 发送协议头
-		headers := []string{
-			"FILE\n",
-			fmt.Sprintf("%s|%d|%s|%s\n", formatUnixPath(fullPath), fileInfo.Size(), ct, mt),
+	// 发送协议头
+	headers := []string{
+		"FILE\n",
+		fmt.Sprintf("%s|%d|%s|%s\n", formatUnixPath(fullPath), fileInfo.Size(), ct, mt),
+	}
+	for _, h := range headers {
+		if _, err := fConn.Write([]byte(h)); err != nil {
+			return fmt.Errorf("发送头部失败: %w", err)
 		}
-		for _, h := range headers {
-			if _, err := fConn.Write([]byte(h)); err != nil {
-				return
-				// return fmt.Errorf("发送头部失败: %w", err)
-			}
-		}
+	}
 
-		// 发送文件内容
-		file, err := os.Open(fullPath)
-		if err != nil {
-			return
-			// return fmt.Errorf("文件打开失败: %w", err)
-		}
-		defer file.Close()
+	// 发送文件内容
+	file, err := os.Open(fullPath)
+	if err != nil {
+		return fmt.Errorf("文件打开失败: %w", err)
+	}
+	defer file.Close()
 
-		counter := &WriteCounter{Total: fileInfo.Size(), FileName: fullPath, StartTime: time.Now()}
-		src := io.TeeReader(file, counter)
+	counter := &WriteCounter{Total: fileInfo.Size(), FileName: fullPath, StartTime: time.Now()}
+	src := io.TeeReader(file, counter)
 
-		if SpeedLimit > 0 {
+	if SpeedLimit > 0 {
 
-			// 改动缓冲区大小
-			fileSize := fileInfo.Size()
-			switch {
-			case fileSize < 10*1024*1024: // <10MB
-				bufferSize = 32 * 1024 // 32KB
-			case fileSize < 500*1024*1024: // 10MB~500MB
-				bufferSize = 256 * 1024 // 256KB
-			default: // >500MB
-				bufferSize = 1024 * 1024 // 1MB
-			}
-
-			limiter := rate.NewLimiter(rate.Limit(SpeedLimit), bufferSize)
-			if _, err := t.rateLimitedCopyWithContext(fConn, src, limiter, fullPath); err != nil {
-				return
-				// return fmt.Errorf("传输失败: %w", err)
-			}
-		} else {
-			if _, err := io.Copy(fConn, src); err != nil {
-				return
-				// return fmt.Errorf("传输失败: %w", err)
-			}
+		// 改动缓冲区大小
+		fileSize := fileInfo.Size()
+		switch {
+		case fileSize < 10*1024*1024: // <10MB
+			bufferSize = 32 * 1024 // 32KB
+		case fileSize < 500*1024*1024: // 10MB~500MB
+			bufferSize = 256 * 1024 // 256KB
+		default: // >500MB
+			bufferSize = 1024 * 1024 // 1MB
 		}
 
-		// finalize logging
-		counter.Finalize()
-	})
+		limiter := rate.NewLimiter(rate.Limit(SpeedLimit), bufferSize)
+		if _, err := t.rateLimitedCopyWithContext(fConn, src, limiter, fullPath); err != nil {
+			return fmt.Errorf("传输失败: %w", err)
+		}
+	} else {
+		if _, err := io.Copy(fConn, src); err != nil {
+			return fmt.Errorf("传输失败: %w", err)
+		}
+	}
 
+	// finalize logging
+	counter.Finalize()
 	return nil
 }
 
@@ -385,19 +377,6 @@ func (c *WriteCounter) Finalize() {
 
 	logMsg := fmt.Sprintf("\r\033[1;32m%s\033[0m | 完成: \033[1;35m100.00%%\033[0m | 平均速度: \033[1;34m%.2f KB/s\033[0m", c.FileName, avgSpeed)
 	fmt.Println(logMsg)
-}
-
-func formatSize(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
-	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
 func connectWithRetry(serverAddr string, errChan chan<- error) (net.Conn, error) {
