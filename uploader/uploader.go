@@ -20,12 +20,8 @@ var (
 
 // 全局统一的上传队列和worker管理
 var (
-	// GlobalFileQueue chan FileQueueTask
-	// GlobalUploadWorkers  int32 = 0
 	ActiveUploadTasks atomic.Int32 // 正在扫描中的任务数
-	// GlobalWorkerShutdown       = make(chan struct{})
-	// GlobalWorkerWG       sync.WaitGroup
-	PendingFiles atomic.Int64 // 新增：全局待上传文件计数
+	PendingFiles      atomic.Int64 // 新增：全局待上传文件计数
 )
 
 // 全局统一的文件任务结构体
@@ -82,6 +78,24 @@ func init() {
 			}
 		}
 	}()
+}
+
+// 新增：统一的“发一条通知”函数（全局通用）
+func NotifyServer(message string, conn net.Conn) error {
+
+	if conn == nil {
+		fConn, err := connectWithRetry(ServerAddr, nil)
+		if err != nil {
+			// LogMessage(fmt.Sprintf("连接失败: %v", err))
+			return fmt.Errorf("连接失败: %w", err)
+		}
+		defer fConn.Close()
+		fConn.Write([]byte("NOTIFY\n" + message + "\n"))
+	} else {
+		conn.Write([]byte("NOTIFY\n" + message + "\n"))
+	}
+
+	return nil
 }
 
 // 调用接口的信息转换
