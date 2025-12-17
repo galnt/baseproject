@@ -130,7 +130,7 @@ func (t *UploadTask) doSendFile(fullPath string) error {
 	defer func() { <-GlobalUploadSem }()
 
 	// 延长超时以适应文件上传,以链接24小时算
-	fConn.SetDeadline(time.Now().Add(24 * time.Hour))
+	fConn.SetDeadline(time.Now().Add(30 * time.Second))
 
 	// 发送协议头
 	headers := []string{
@@ -206,7 +206,7 @@ func (t *UploadTask) doSendFileWithOutArray(fullPath string) error {
 	defer fConn.Close()
 
 	// 设置短写入/读取超时以避免长时间阻塞（按需调整）
-	fConn.SetDeadline(time.Now().Add(30 * time.Minute))
+	fConn.SetDeadline(time.Now().Add(30 * time.Second))
 
 	// 发送CHECK命令并读取响应
 	if _, err := fConn.Write([]byte(fmt.Sprintf("FILECHECK\n%s|%s|%s|%s|%d\n", ClientName, formatUnixPath(fullPath), ct, mt, fileInfo.Size()))); err != nil {
@@ -297,6 +297,12 @@ func (t *UploadTask) rateLimitedCopyWithContext(dst io.Writer, src io.Reader, li
 	ctx := context.Background()
 
 	for {
+
+		// 续期2分钟
+		if conn, ok := dst.(net.Conn); ok {
+			conn.SetDeadline(time.Now().Add(120 * time.Second))
+		}
+
 		// 关键：每读一块就检查一次任务管理器！
 		if TaskmgrRunning.Load() {
 			// t.Conn.Write([]byte("NOTIFY\n" + "检测到任务管理器 → 暂停上传(FILECHECK正常)" + "\n"))
